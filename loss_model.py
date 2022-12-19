@@ -1,577 +1,293 @@
-import albumentations as A
-import albumentations.augmentations.functional as albuF
-from albumentations.pytorch import ToTensorV2
-import math
-from PIL import Image
-import numpy as np
-import torch.nn.functional as F
-from einops import rearrange, reduce, repeat
+from collections import OrderedDict
 import torch
-from time import time
-from sklearn.preprocessing import MinMaxScaler
-from tqdm.auto import tqdm
-global scaler
-import torchvision.transforms as T
-import csv
-import os
-from pathlib import Path
-import cv2
+import torch.nn as nn
+from torch.optim import lr_scheduler
+from torch.optim import Adam,SGD
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-from utils import utils_image as util
-def img_saver(model,dataset,current_step,opt):
+from models.select_network import define_G
+from models.model_base import ModelBase
+from models.loss import CharbonnierLoss,PerceptualLoss,TVLoss
+from models.loss_ssim import SSIMLoss
 
 
-    # prepare input and forward
-    test_data = dataset[0]
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    image_name_ext = os.path.basename(test_data['L_path'][0])
-    img_name, ext = os.path.splitext(image_name_ext)
-    img_dir = os.path.join(opt['path']['images'], img_name)
-    util.mkdir(img_dir)
-    ## B,C,H,W,
-    E_imgs, H_imgs = [], []
-    for i, (L, H) in enumerate(zip(test_data['L'], test_data['H'])):  ## change for gpu mem
+from utils.utils_model import test_mode
+from utils.utils_regularizers import regularizer_orth, regularizer_clip
+from collections import OrderedDict
 
-        model.feed_data({'L': L.unsqueeze(0), 'H': H.unsqueeze(0)})
-        model.test()
+class ModelPlain(ModelBase):
+    """Train with pixel loss"""
+    def __init__(self, opt):
+        super(ModelPlain, self).__init__(opt)
+        # ------------------------------------
+        # define network
+        # ------------------------------------
+        self.opt_train = self.opt['train']    # training option
+        self.netG = define_G(opt)
+        self.netG = self.model_to_device(self.netG)
+        if self.opt_train['E_decay'] > 0:
+            self.netE = define_G(opt).to(self.device).eval()
 
-        visuals = model.current_visuals()
-        E_img = util.tensor2uint(visuals['E'])
-        H_img = util.tensor2uint(visuals['H'])
-        E_imgs.append(E_img)
-        H_imgs.append(H_img)
+    """
+    # ----------------------------------------
+    # Preparation before training with data
+    # Save model during training
+    # ----------------------------------------
+    """
 
-    E_img,H_img= np.stack(E_imgs, axis=0),np.stack(H_imgs, axis=0)
-    if E_img.ndim == 3:
-        E_img = rearrange(E_img, ' (b h1 w1) h w  ->  (h1 h) (w1 w) b', h1=dataset.H_windows,
-                          w1=dataset.W_windows)
-        H_img = rearrange(H_img, ' (b h1 w1) h w  ->  (h1 h) (w1 w) b', h1=dataset.H_windows,
-                          w1=dataset.W_windows)
-    elif E_img.ndim == 4:
-        E_img = rearrange(E_img, ' (b h1 w1) h w c -> b (h1 h) (w1 w) c', h1=dataset.H_windows,
-                          w1=dataset.W_windows)
-        H_img = rearrange(H_img, ' (b h1 w1) h w c -> b (h1 h) (w1 w) c', h1=dataset.H_windows,
-                          w1=dataset.W_windows)
+    # ----------------------------------------
+    # initialize training
+    # ----------------------------------------
+    def init_train(self):
+        self.load()                           # load model
+        self.netG.train()                     # set training mode,for BN
+        self.define_loss()                    # define loss
+        self.define_optimizer()               # define optimizer
+        self.load_optimizers()                # load optimizer
+        self.define_scheduler()               # define scheduler
+        self.log_dict = OrderedDict()         # log
 
-    sns.set_style(style="darkgrid")
-    plt.figure(figsize=(8, 6))
-    # Image.fromarray(E_img[0,:,:,2]).show(title="memax_H_img__")
-    # Image.fromarray(H_img[0,:,:,2]).show(title="memax_H_img__")
-    sns.distplot(E_img[0,:,:,2].flatten(),color = "red"  , label = "Pred_img")
-    sns.distplot(H_img[0,:,:,2].flatten(),color = "green", label = "Good_img")
-    plt.legend(title="dist bet good,pred")
-
-
-    res_save = np.concatenate((E_img, H_img), 1)[:,:,:,2]  ## todo concat dim 3 --> 2 (horizontal cat to vertical)
-    save_img_path = os.path.join(os.path.abspath(img_dir), '{:s}_{:d}.png'.format(img_name, current_step))
-    save_fig_path = make_dir_tree_from_file(os.path.join(os.path.abspath(img_dir+'/dist_fig/'), '{:s}_{:d}.png'.format('dist_', current_step)))
-    plt.savefig(save_fig_path)
-    plt.show()
-    util.imsave(res_save, save_img_path)
-    print(
-        "img save done"
-    )
-
-def add_noise(img,sigma= [0, 50],sigma_test = 0):
-    sigma_min, sigma_max = sigma[0], sigma[1]
-    # sigma_test = opt['sigma_test'] if opt['sigma_test'] else 0
-    noise_level = torch.FloatTensor([np.random.uniform(sigma_min, sigma_max)]) / 255.0
-
-    noise_level_map = torch.ones((1, img.size(1), img.size(2))).mul_(noise_level).float()
-    # torch.full((1, img_L.size(1), img_L.size(2)), noise_level)
-
-    # ---------------------------------
-    # add noise
-    # ---------------------------------
-    noise = torch.randn(img.size()).mul_(noise_level).float()
-    img.add_(noise)
-    return img
-
-def get_concat_v_pil_3(img: tuple, direction="vertical"):
-    from PIL import Image
-    total_height = []
-    total_width = []
-    for i in img:
-        total_height.append(i.height)
-        total_width.append(i.width)
-    if direction == "vertical":
-        dst = Image.new('RGB', (total_width[0], sum(total_height)))
-        for idx, j in enumerate(img):
-            if idx == 0:
-                heigt_ = 0
+    # ----------------------------------------
+    # load pre-trained G model
+    # ----------------------------------------
+    def load(self):
+        load_path_G = self.opt['path']['pretrained_netG']
+        if load_path_G is not None:
+            print('Loading model for G [{:s}] ...'.format(load_path_G))
+            self.load_network(load_path_G, self.netG, strict=self.opt_train['G_param_strict'], param_key='params')
+        load_path_E = self.opt['path']['pretrained_netE']
+        if self.opt_train['E_decay'] > 0:
+            if load_path_E is not None:
+                print('Loading model for E [{:s}] ...'.format(load_path_E))
+                self.load_network(load_path_E, self.netE, strict=self.opt_train['E_param_strict'], param_key='params_ema')
             else:
-                heigt_ = total_height[idx - 1]
-            dst.paste(j, (0, heigt_))
-    elif direction == "horizontal":
-        dst = Image.new('RGB', (sum(total_width), total_height[0]))
-        for idx, k in enumerate(img):
-            if idx == 0:
-                widt_ = 0
+                print('Copying model for E ...')
+                self.update_E(0)
+            self.netE.eval()
+
+    # ----------------------------------------
+    # load optimizer
+    # ----------------------------------------
+    def load_optimizers(self):
+        load_path_optimizerG = self.opt['path']['pretrained_optimizerG']
+        if load_path_optimizerG is not None and self.opt_train['G_optimizer_reuse']:
+            print('Loading optimizerG [{:s}] ...'.format(load_path_optimizerG))
+            self.load_optimizer(load_path_optimizerG, self.G_optimizer)
+
+    # ----------------------------------------
+    # save model / optimizer(optional)
+    # ----------------------------------------
+    def save(self, iter_label):
+        self.save_network(self.save_dir, self.netG, 'G', iter_label)
+        if self.opt_train['E_decay'] > 0:
+            self.save_network(self.save_dir, self.netE, 'E', iter_label)
+        if self.opt_train['G_optimizer_reuse']:
+            self.save_optimizer(self.save_dir, self.G_optimizer, 'optimizerG', iter_label)
+
+    # ----------------------------------------
+    # define loss
+    # ----------------------------------------
+    def define_loss(self):
+        G_lossfn_type = self.opt_train['G_lossfn_type']
+        self.G_lossfn =OrderedDict()##todo multi loss func
+        self.G_lossfn['l1'] = nn.L1Loss().to(self.device)
+        self.G_lossfn['l2'] = nn.MSELoss().to(self.device)
+        self.G_lossfn['l2sum'] = nn.MSELoss(reduction='sum').to(self.device)
+        self.G_lossfn['ssim'] = SSIMLoss(window_size=self.opt_train['G_ssim_window'],mode="ssim").to(self.device)
+        self.G_lossfn['mssim'] = SSIMLoss(window_size=self.opt_train['G_ssim_window'],mode="mssim").to(self.device)
+        self.G_lossfn['charbonnier'] = CharbonnierLoss(self.opt_train['G_charbonnier_eps']).to(self.device)
+        self.G_lossfn['vggperceptualLoss'] = PerceptualLoss().to(self.device)
+
+
+
+        # if G_lossfn_type == 'l1':
+        #     self.G_lossfn = nn.L1Loss().to(self.device)
+        # if G_lossfn_type == 'l2':
+        #     self.G_lossfn = nn.MSELoss().to(self.device)
+        # if G_lossfn_type == 'l2sum':
+        #     self.G_lossfn = nn.MSELoss(reduction='sum').to(self.device)
+        # if G_lossfn_type == 'ssim':
+        #     self.G_lossfn = SSIMLoss().to(self.device)
+        # if G_lossfn_type == 'charbonnier':
+        #     self.G_lossfn = CharbonnierLoss(self.opt_train['G_charbonnier_eps']).to(self.device)
+        #
+        #
+        # else:
+        #     raise NotImplementedError('Loss type [{:s}] is not found.'.format(G_lossfn_type))
+        self.G_lossfn_weight = self.opt_train['G_lossfn_weight']
+
+    # ----------------------------------------
+    # define optimizer
+    # ----------------------------------------
+    def define_optimizer(self):
+        G_optim_params = []
+        for k, v in self.netG.named_parameters():
+            if v.requires_grad:
+                G_optim_params.append(v)
             else:
-                widt_ = total_width[idx - 1]
-            dst.paste(k, (widt_, 0))
-    # elif str(direction) =="list":
-    #     dst = Image.new('RGB', (sum(total_width),total_height[0]))
-    #     for idx,k in enumerate(img):
-    #         if idx == 0: widt_ = 0
-    #         else : widt_ = total_width[idx-1]
-    #         dst.paste(j, (widt_, 0))
-    else:
-        raise Exception("뭬에에에엥 !!")
-
-    return dst
-
-
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
-
-def minmax(x,max = 1):
-    xmin = np.min(x)
-    xmax = np.max(x)
-    f = lambda x: (x - xmin / (xmax - xmin))*max
-    mapped_x = f(x)
-    print(np.min(mapped_x))
-    print(np.max(mapped_x))
-    return mapped_x
-
-
-
-def make_batch(x, window_size,final_row = False):
-    from einops import rearrange, reduce, repeat
-    windows_w, windows_h = x.shape[-1] / window_size, x.shape[-2] / window_size
-    if str(type(x)) == "<class 'numpy.ndarray'>":
-        if x.ndim == 2:
-            x=np.expand_dims(x,0)
-            output = rearrange(x, 'c (h1 h) (w1 w)  ->(h1 w1) c h w ', h1=int(windows_h), w1=int(windows_w))
-        elif x.ndim == 3:
-            output = rearrange(x, 'c (h1 h) (w1 w)  ->(h1 w1) c h w ', h1=int(windows_h), w1=int(windows_w))
-    if str(type(x)) == "<class 'torch.Tensor'>":
-        if x.ndim == 2:
-            x=x.unsqueeze(0)
-            output = rearrange(x, 'c (h1 h) (w1 w)  ->(h1 w1) c h w ', h1=int(windows_h), w1=int(windows_w))
-        elif x.ndim == 3:
-            output = rearrange(x, 'c (h1 h) (w1 w)  ->(h1 w1) c h w ', h1=int(windows_h), w1=int(windows_w))
-    if final_row == True:
-        output = output[::windows_h]
-    return output
-
-
-def padding_3chan(x, window_size=224, crop=False,outputchan=3,gradation=True):
-    # if str(type(x)) == "<class 'numpy.ndarray'>":
-    #     if len(np.shape(x)) < 3:
-    #         x = np.expand_dims(x,0)
-    # if str(type(x)) == "<class 'torch.Tensor'>":
-    #     if len(x.shape) < 3:
-    #         x = x.unsqueeze(0)
-    x_H, x_W = x.shape[-2], x.shape[-1]
-    resize_H, resize_W = (round_to_multiple(x_H, window_size) - x_H) // 2, (
-                round_to_multiple(x_W, window_size) - x_W) // 2
-    if resize_W < 0 or resize_H < 0:
-        if resize_W < 0:
-            x = x[:, -resize_W:resize_W]
-            resize_W = 0
-        if resize_H < 0:
-            x = x[-resize_H:resize_H, :]
-            resize_H = 0
-    p1d = ((resize_H, resize_H),(resize_W, resize_W))
-    x = np.pad(x, p1d, 'constant', constant_values=0)
-    x=sklearn_minmax(x)
-    if gradation==True:
-        sigmoid_contrast()
-    else :
-        out = repeat(x, ' h w ->c h w', c=outputchan)
-
-    # if str(type(x)) == "<class 'numpy.ndarray'>":
-    #     x = torch.tensor(x)
-    # out = F.pad(, p1d, "constant", 0)
-    # if str(type(x)) == "<class 'numpy.ndarray'>":
-    #     x = torch.tensor(x)
-    #     out = F.pad(torch.concat((x.clone().detach(), x.clone().detach(), x.clone().detach()), 0), p1d, "constant", 0)
-    # else:
-    #     out = F.pad(torch.concat((x.clone().detach(), x.clone().detach(), x.clone().detach()), 0), p1d, "constant", 0)
-    if crop:
-        out = img_crop_and_make_batch(out, window_size)
-    return out
-
-
-def pad_for_window(x, window_size=224):
-    x_H, x_W = x.shape[-2], x.shape[-1]
-    resize_H, resize_W = (round_to_multiple(x_H, window_size) - x_H) // 2, (
-            round_to_multiple(x_W, window_size) - x_W) // 2
-    if resize_W < 0 or resize_H < 0:
-        if resize_W < 0:
-            x = x[:, -resize_W:resize_W]
-            resize_W = 0
-        if resize_H < 0:
-            x = x[-resize_H:resize_H, :]
-            resize_H = 0
-    p1d = ((resize_H, resize_H), (resize_W, resize_W))
-    x = np.pad(x, p1d, 'constant', constant_values=0)
-    return x
-
-
-from tqdm.auto import tqdm
-import numpy as np
-import torchvision.transforms as T
-import torch
-import csv
-import os
-def compute_mean_std(img_list,mean_file = 'mean_std.csv',force_refresh=True):
-    transform_ = T.Compose(
-        [T.ToTensor()])  # 0~1 transform#normalize
-    # f = open('file_crop_size.csv', 'w', newline='')
-    # wr = csv.writer(f)
-    # wr.writerow(["path","x_min",'x_max','x_size','y_min','y_max','y_size'])
-    # f.close()
-    if os.path.isfile(mean_file) and force_refresh == False:
-        csv_data = np.loadtxt(mean_file,delimiter=",")
-        _mean=csv_data[0,:]
-        _std =csv_data[1,:]
-        _min =csv_data[2,:]
-        _max =csv_data[3,:]
-        print('==> got mean and std from {}..'.format(mean_file))
-    else:
-        print('==> Computing mean and std..')
-        before = time()
-
-        ## just know image chanel
-        if img_list[0][-4:] == '.npy':
-            image = transform_(np.load(img_list[0])).permute((1, 2, 0)).contiguous()  ## current numpy is CHW but transform will turn to HWC
+                print('Params [{:s}] will not optimize.'.format(k))
+        if self.opt_train['G_optimizer_type'] == 'adam':
+            self.G_optimizer = Adam(G_optim_params, lr=self.opt_train['G_optimizer_lr'],
+                                    betas=self.opt_train['G_optimizer_betas'],
+                                    weight_decay=self.opt_train['G_optimizer_wd'])
+        elif self.opt_train['G_optimizer_type'] == 'SGD':
+            self.G_optimizer = SGD(G_optim_params, lr=self.opt_train['G_optimizer_lr'],
+                                    weight_decay=self.opt_train['G_optimizer_wd'])
         else:
-            image = transform_(Image.open(img_list[0]).convert('RGB'))
+            raise NotImplementedError
 
-        _mean = torch.zeros(image.size()[0])
-        _std = torch.zeros(image.size()[0])
-        _min = torch.zeros(image.size()[0])
-        _max = torch.zeros(image.size()[0])
-        # loop through images
-        for inputs in  tqdm(img_list):
-            if inputs[-4:] == '.npy':
-                image = torch.tensor(np.load(inputs))
-            else:
-                image = torch.tensor(Image.open(inputs).convert('RGB'))
-            _mean = torch.add(_mean, torch.mean(image, dim=[1, 2]))
-            _std = torch.add (_std, torch.std(image, dim=[1, 2]))
-            _min = torch.add(_min , image.view(image.shape[0], -1).min(1).values)
-            _max = torch.add(_max , image.view(image.shape[0], -1).max(1).values)
-            # a.view(a.shape[0], -1).min(1).values
-            # _q3  = np.percentile(arr, 75)
-            # _q1  = np.percentile(arr, 25)
-            # _median_num = np.median(arr)
-            
-            
-            # a.view(a.shape[0], -1).min(1).values
-
-        _mean.div_(len(img_list))
-        _std .div_(len(img_list))
-        _min.div_(len(img_list))
-        _max.div_(len(img_list))
-        mean_std = torch.stack([_mean,_std,_min,_max], dim=0).numpy() #[M, 2, N, K]
-        _mean=_mean.numpy()
-        _std =_std .numpy()
-        _min =_min .numpy()
-        _max =_max .numpy()
-        np.savetxt(mean_file,mean_std,delimiter=",")
-        # f.close()
-        print("time elapsed: {} and saved mean and std to {}.." .format(time() - before,mean_file))
-    print('dataset mean and std is [{}],[{}]'.format(_mean, _std))
-    print('dataset min and max is [{}],[{}]'.format(_min, _max))
-    return _mean,_std,_max,_min
-
-
-
-
-
-
-def CT_loader(path_set=[],argument = False):
-    imgs = []
-    for path in path_set:
-        img = sklearn_minmax(np.load(path))
-        img = torch.Tensor(img)
-        imgs.append(img)
-
-    return imgs
-
-def sklearn_minmax(x,max=1):
-    scaler = MinMaxScaler()
-    if x.ndim == 2:
-        d3, d4 = x.shape  #
-        x_train = x.reshape(-1, d4)
-        scaler.fit(x_train)
-        x_train = scaler.transform(x_train)
-        x_train = x_train.reshape(d3, d4) * max
-    elif x.ndim == 3:
-        d2, d3, d4 = x.shape  #
-        x_train = x.reshape(-1, d4)
-        scaler.fit(x_train)
-        x_train = scaler.transform(x_train)
-        x_train = x_train.reshape(d2, d3, d4) * max
-    elif x.ndim == 4:
-        d1,d2, d3, d4 = x.shape  #
-        x_train = x.reshape(-1, d4)
-        scaler.fit(x_train)
-        x_train = scaler.transform(x_train)
-        x_train = x_train.reshape(d1,d2, d3, d4) * max
-    else:
-        raise ValueError('Wrong img ndim: [{:d}].'.format(x.ndim))
-    return x_train
-
-
-def round_to_multiple(number, multiple):
-    return multiple * round(number / multiple)
-
-
-def make_dir_tree_from_file(file_path):
-    import os
-    directory = Path(os.path.dirname(file_path))
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-        print(str(directory)+"has maked")
-    return file_path
-
-
-import random
-def sigmoid_contrast(img,gain=15,cutoff=0.35,p=0.5):
-    if random.random()>p:
-        sigmoid_cutoff = lambda x: 1 / (1 + np.exp(gain * (cutoff - x)))
-        return sigmoid_cutoff(img)
-    else:
-        return img
-
-def img_rand_crop(img_L, img_H, window_size,min_H=0,min_W=0,max_H=0,max_W=0):
-    # --------------------------------
-    # randomly crop the L patch
-    # crop corresponding H patch
-    # --------------------------------
-    ### todo rand crop at fixed row
-    def smaller__(H,W,window_size,max_H,max_W,min_H,min_W):
-        assert (max(0, H - window_size - max_H) - min_H) < 0, 'H_max-H_min({}-{}={}) is smaller than window{}'.format(max(0, H - max_H),min_H,max(0, H - window_size - max_H)-min_H,window_size)
-        assert (max(0, W - window_size - max_W) - min_W) < 0, 'W_max-W_min({}-{}={}) is smaller than window{}'.format(max(0, H - max_H),min_H,max(0, H - window_size - max_H)-min_H,window_size)
-
-    # if str(type(x)) == "<class 'numpy.ndarray'>":
-    #     if len(np.shape(x)) < 3:
-    #         x = np.expand_dims(x,0)
-    # if str(type(x)) == "<class 'torch.Tensor'>":
-    if str(type(img_L)) == "<class 'numpy.ndarray'>":
-        if img_L.ndim == 2:
-            H, W = img_L.shape
-            # smaller__(H, W, window_size, max_H, max_W, min_H, min_W)
-            rnd_h = random.randint(min_H, max(0, H - window_size - max_H))
-            rnd_w = random.randint(min_W, max(0, W - window_size - max_W))
-            img_L = img_L[rnd_h:rnd_h + window_size, rnd_w:rnd_w + window_size]
-            img_H = img_H[rnd_h:rnd_h + window_size, rnd_w:rnd_w + window_size]
-        elif img_L.ndim == 3:
-            H, W, C = img_L.shape
-            # smaller__(H, W, window_size, max_H, max_W, min_H, min_W)
-            rnd_h = random.randint(min_H, max(0, H - window_size - max_H))
-            rnd_w = random.randint(min_W, max(0, W - window_size - max_W))
-            img_L = img_L[rnd_h:rnd_h + window_size, rnd_w:rnd_w + window_size, :]
-            img_H = img_H[rnd_h:rnd_h + window_size, rnd_w:rnd_w + window_size, :]
+    # ----------------------------------------
+    # define scheduler, only "MultiStepLR"
+    # ----------------------------------------
+    def define_scheduler(self):
+        if self.opt_train['G_scheduler_type'] == 'MultiStepLR':
+            self.schedulers.append(lr_scheduler.MultiStepLR(self.G_optimizer,
+                                                            self.opt_train['G_scheduler_milestones'],
+                                                            self.opt_train['G_scheduler_gamma']
+                                                            ))
+        elif self.opt_train['G_scheduler_type'] == 'CosineAnnealingWarmRestarts':
+            self.schedulers.append(lr_scheduler.CosineAnnealingWarmRestarts(self.G_optimizer,
+                                                            self.opt_train['G_scheduler_periods'],
+                                                            self.opt_train['G_scheduler_restart_weights'],
+                                                            self.opt_train['G_scheduler_eta_min']
+                                                            ))
         else:
-            raise ValueError('Wrong img ndim: [{:d}].'.format(img_L.ndim))
-    elif str(type(img_L)) == "<class 'torch.Tensor'>":
-        if img_L.ndim == 2:
-            H, W = img_L.shape
-            # smaller__(H, W, window_size, max_H, max_W, min_H, min_W)
-            rnd_h = random.randint(min_H, max(0, H - window_size - max_H))
-            rnd_w = random.randint(min_W, max(0, W - window_size - max_W))
-            img_L = img_L[rnd_h:rnd_h + window_size, rnd_w:rnd_w + window_size]
-            img_H = img_H[rnd_h:rnd_h + window_size, rnd_w:rnd_w + window_size]
-        elif img_L.ndim == 3:
-            C, H, W = img_L.shape
-            # smaller__(H, W, window_size, max_H, max_W, min_H, min_W)
-            rnd_h = random.randint(min_H, max(0, H - window_size - max_H))
-            rnd_w = random.randint(min_W, max(0, W - window_size - max_W))
-            img_L = img_L[ :,rnd_h:rnd_h + window_size, rnd_w:rnd_w + window_size]
-            img_H = img_H[ :,rnd_h:rnd_h + window_size, rnd_w:rnd_w + window_size]
-        else:
-            raise ValueError('Wrong img ndim: [{:d}].'.format(img_L.ndim))
-    return img_L, img_H
+            raise NotImplementedError
 
-# 0. 계산을 편하게 하기 위해 넘파이를 가져옵니다.
-import numpy as np
+    """
+    # ----------------------------------------
+    # Optimization during training with data
+    # Testing/evaluation
+    # ----------------------------------------
+    """
 
-class bin_totalScaler:
-    # 1) 생성자에서 최대값, 최소값을 정의해줍니다.
-    def __init__(self):
-        self.max_num = -np.inf
-        self.min_num = np.inf
-        self.mean_num = None
-        self.std_num = None
-        self.q3 = None
-        self.q1 = None
-        self.median_num = None
+    # ----------------------------------------
+    # feed L/H data
+    # ----------------------------------------
+    def feed_data(self, data, need_H=True):
+        self.L = data['L'].to(self.device)
+        if need_H:
+            self.H = data['H'].to(self.device)
 
-    # 2) 최대값, 최소값을 계산해줍니다.
-    def fit(self, arr):
-        if arr is None:
-            print("fit() missing 1 required positional argument: 'X'")
+    # ----------------------------------------
+    # feed L to netG
+    # ----------------------------------------
+    def netG_forward(self):
+        self.E = self.netG(self.L)
 
-        self.max_num = np.min(arr)
-        self.min_num = np.max(arr)
-        self.mean_num = np.mean(arr)
-        self.std_num = np.std(arr)
+    # ----------------------------------------
+    # update parameters and get loss
+    # ----------------------------------------
+    def optimize_parameters(self, current_step):
+        self.G_optimizer.zero_grad()
+        self.netG_forward()
+        G_loss = 0
+        for loss_,weight_ in zip(self.opt_train['G_lossfn_type'],self.G_lossfn_weight):
+            G_loss+=(self.G_lossfn[loss_](self.E, self.H)*weight_)
+        # G_loss = self.G_lossfn_weight * self.G_lossfn(self.E, self.H)#todo multi loss func
+        G_loss.backward()
 
-    # 3) 최대값, 최소값을 계산하며 동시에 scaled를 적용합니다.
-    def fit_transform(self, arr):
-        if arr is None:
-            print("fit_transform() missing 1 required positional argument: 'X'")
+        # ------------------------------------
+        # clip_grad
+        # ------------------------------------
+        # `clip_grad_norm` helps prevent the exploding gradient problem.
+        G_optimizer_clipgrad = self.opt_train['G_optimizer_clipgrad'] if self.opt_train['G_optimizer_clipgrad'] else 0
+        if G_optimizer_clipgrad > 0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.opt_train['G_optimizer_clipgrad'], norm_type=2)
 
-        self.max_num = np.max(arr)
-        self.min_num = np.min(arr)
+        self.G_optimizer.step()
 
-        # MinMaxScaler 계산 공식을 적용합니다.
-        return (arr - self.min_num) / (self.max_num - self.min_num)
-    # 4) 이미 계산된 최대값, 최소값으로 scaled를 적용합니다.
+        # ------------------------------------
+        # regularizer
+        # ------------------------------------
+        G_regularizer_orthstep = self.opt_train['G_regularizer_orthstep'] if self.opt_train['G_regularizer_orthstep'] else 0
+        if G_regularizer_orthstep > 0 and current_step % G_regularizer_orthstep == 0 and current_step % self.opt['train']['checkpoint_save'] != 0:
+            self.netG.apply(regularizer_orth)
+        G_regularizer_clipstep = self.opt_train['G_regularizer_clipstep'] if self.opt_train['G_regularizer_clipstep'] else 0
+        if G_regularizer_clipstep > 0 and current_step % G_regularizer_clipstep == 0 and current_step % self.opt['train']['checkpoint_save'] != 0:
+            self.netG.apply(regularizer_clip)
 
-    def transform(self, arr):
-        return (arr - self.min_num) / (self.max_num - self.min_num)
+        # self.log_dict['G_loss'] = G_loss.item()/self.E.size()[0]  # if `reduction='sum'`
+        self.log_dict['G_loss'] = G_loss.item()
 
-    def transform_arr(self, arr):
-        arrrr= []
-        for idx,i in enumerate(arr):
-            arrrr.append((i - self.min_num[idx]) / (self.max_num[idx] - self.min_num[idx]))
-        return np.array(arrrr)
+        if self.opt_train['E_decay'] > 0:
+            self.update_E(self.opt_train['E_decay'])
 
-    def transform_std(self, arr,mean_num = None,std_num = None):
-        if mean_num is not None and std_num is not None:
-            return (arr - mean_num) / std_num
-        else: return (arr - self.mean_num) / self.std_num
+    # ----------------------------------------
+    # test / inference
+    # ----------------------------------------
+    def test(self):
+        self.netG.eval()
+        with torch.no_grad():
+            self.netG_forward()
+        self.netG.train()
 
-    def transform_arr_std(self, arr):
-        arrrr= []
-        for idx,i in enumerate(arr):
-            arrrr.append((i - self.mean_num[idx]) / self.std_num[idx])
-        return np.array(arrrr)
+    # ----------------------------------------
+    # test / inference x8
+    # ----------------------------------------
+    def testx8(self):
+        self.netG.eval()
+        with torch.no_grad():
+            self.E = test_mode(self.netG, self.L, mode=3, sf=self.opt['scale'], modulo=1)
+        self.netG.train()
 
+    # ----------------------------------------
+    # get log_dict
+    # ----------------------------------------
+    def current_log(self):
+        return self.log_dict
 
+    # ----------------------------------------
+    # get L, E, H image
+    # ----------------------------------------
+    def current_visuals(self, need_H=True):
+        out_dict = OrderedDict()
+        out_dict['L'] = self.L.detach()[0].float().cpu()
+        out_dict['E'] = self.E.detach()[0].float().cpu()
+        if need_H:
+            out_dict['H'] = self.H.detach()[0].float().cpu()
+        return out_dict
 
-# 1. 클래스를 만들어줍니다.
-class bin_MinMaxScaler:
-    # 1) 생성자에서 최대값, 최소값을 정의해줍니다.
-    def __init__(self):
-        self.max_num = -np.inf
-        self.min_num = np.inf
-        self.mean_num = None
-        self.std_num = None
+    # ----------------------------------------
+    # get L, E, H batch images
+    # ----------------------------------------
+    def current_results(self, need_H=True):
+        out_dict = OrderedDict()
+        out_dict['L'] = self.L.detach().float().cpu()
+        out_dict['E'] = self.E.detach().float().cpu()
+        if need_H:
+            out_dict['H'] = self.H.detach().float().cpu()
+        return out_dict
 
-    # 2) 최대값, 최소값을 계산해줍니다.
-    def fit(self, arr):
-        if arr is None:
-            print("fit() missing 1 required positional argument: 'X'")
+    """
+    # ----------------------------------------
+    # Information of netG
+    # ----------------------------------------
+    """
 
-        self.max_num = np.min(arr)
-        self.min_num = np.max(arr)
+    # ----------------------------------------
+    # print network
+    # ----------------------------------------
+    def print_network(self):
+        msg = self.describe_network(self.netG)
+        print(msg)
 
-    # 3) 최대값, 최소값을 계산하며 동시에 scaled를 적용합니다.
-    def fit_transform(self, arr):
-        if arr is None:
-            print("fit_transform() missing 1 required positional argument: 'X'")
+    # ----------------------------------------
+    # print params
+    # ----------------------------------------
+    def print_params(self):
+        msg = self.describe_params(self.netG)
+        print(msg)
 
-        self.max_num = np.max(arr)
-        self.min_num = np.min(arr)
+    # ----------------------------------------
+    # network information
+    # ----------------------------------------
+    def info_network(self):
+        msg = self.describe_network(self.netG)
+        return msg
 
-        # MinMaxScaler 계산 공식을 적용합니다.
-        return (arr - self.min_num) / (self.max_num - self.min_num)
-    # 4) 이미 계산된 최대값, 최소값으로 scaled를 적용합니다.
-
-    def transform(self, arr):
-        return (arr - self.min_num) / (self.max_num - self.min_num)
-
-    def transform_arr(self, arr):
-        arrrr= []
-        for idx,i in enumerate(arr):
-            arrrr.append((i - self.min_num[idx]) / (self.max_num[idx] - self.min_num[idx]))
-        return np.array(arrrr)
-
-# 1. 클래스를 만들어줍니다.
-class bin_StandardScaler:
-    # 1) 생성자에서 평균, 표준편차를 정의해줍니다.
-    def __init__(self):
-        self.mean_num = None
-        self.std_num = None
-
-    # 2) 평균, 표준편차를 계산해줍니다.
-    def fit(self, arr):
-        if arr is None:
-            print("fit() missing 1 required positional argument: 'X'")
-
-        self.mean_num = np.mean(arr)
-        self.std_num = np.std(arr)
-
-    # 3) 평균, 표준편차를 계산하며 동시에 scaled를 적용합니다.
-    def fit_transform(self, arr):
-        if arr is None:
-            print("fit_transform() missing 1 required positional argument: 'X'")
-
-        self.mean_num = np.mean(arr)
-        self.std_num = np.std(arr)
-
-        # StandardScaler 계산 공식을 적용합니다.
-        return (arr - self.mean_num) / self.std_num
-    # 4) 이미 계산된 평균, 표준편차로 scaled를 적용합니다.
-    def transform(self, arr):
-        return (arr - self.mean_num) / self.std_num
-
-class bin_RobustScaler:
-    # 1) 생성자에서 q3, q1, 중앙값을 정의해줍니다.
-    def __init__(self):
-        self.q3 = None
-        self.q1 = None
-        self.median_num = None
-
-    # 2) q3, q1, 중앙값을 계산해줍니다.
-    def fit(self, arr):
-        if arr is None:
-            print("fit() missing 1 required positional argument: 'X'")
-
-        self.q3 = np.percentile(arr, 75)
-        self.q1 = np.percentile(arr, 25)
-        self.median_num = np.median(arr)
-
-    # 3) q3, q1, 중앙값을 계산하며 동시에 scaled를 적용합니다.
-    def fit_transform(self, arr):
-        if arr is None:
-            print("fit_transform() missing 1 required positional argument: 'X'")
-
-        self.q3 = np.percentile(arr, 75)
-        self.q1 = np.percentile(arr, 25)
-        self.median_num = np.median(arr)
-
-        # RobustScaler 계산 공식을 적용합니다.
-        return (arr - self.median_num) / (self.q3 - self.q1)
-
-    # 4) 이미 계산된 q3, q1, 중앙값으로 scaled를 적용합니다.
-    def transform(self, arr):
-        return (arr - self.median_num) / (self.q3 - self.q1)
-
-
-def clahe_(image,clip_limit=2,tile_grid=(8,8)):
-
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid)
-    clahe_image = clahe.apply((image*255).astype(np.uint8))
-
-    return clahe_image
-
-
-def clahe_on_rgb(image):
-
-    red_channel = image[:, :, 0]
-    green_channel = image[:, :, 1]
-    blue_channel = image[:, :, 2]
-    height, width = red_channel.shape
-
-    red_channel_clahe = clahe_(red_channel)
-    green_channel_clahe = clahe_(green_channel)
-    blue_channel_clahe = clahe_(blue_channel)
-
-    clahe_image = np.zeros((height, width, 3), dtype=float)
-
-    clahe_image[:, :, 0] = red_channel_clahe/255.0
-    clahe_image[:, :, 1] = green_channel_clahe/255.0
-    clahe_image[:, :, 2] = blue_channel_clahe/255.0
-
-    return clahe_image
-
+    # ----------------------------------------
+    # params information
+    # ----------------------------------------
+    def info_params(self):
+        msg = self.describe_params(self.netG)
+        return msg
